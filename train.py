@@ -1,0 +1,96 @@
+﻿import argparse
+import os
+
+import torch
+from torch.utils.data import DataLoader
+
+from dataset import MeshPointCloudDataset
+from loss import total_unsupervised_loss
+from model import PointDecompositionModel
+from utils import make_augmented_features
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train an unsupervised 3D part decomposition model.")
+    parser.add_argument("--data-dir", type=str, default=None, help="Directory with .obj/.xyz/.txt/.pts/.npy files.")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-points", type=int, default=2048)
+    parser.add_argument("--embedding-dim", type=int, default=64)
+    parser.add_argument("--num-clusters", type=int, default=6)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--use-normals", action="store_true")
+    parser.add_argument("--use-slot-attention", action="store_true")
+    parser.add_argument("--num-slots", type=int, default=8)
+    parser.add_argument("--synthetic-size", type=int, default=64, help="Used when no real dataset directory is provided.")
+    parser.add_argument("--save-path", type=str, default="checkpoint.pt")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cpu")
+
+    dataset = MeshPointCloudDataset(
+        data_dir=args.data_dir,
+        num_points=args.num_points,
+        use_normals=args.use_normals,
+        synthetic_size=args.synthetic_size,
+    )
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+
+    model = PointDecompositionModel(
+        input_dim=6 if args.use_normals else 3,
+        embedding_dim=args.embedding_dim,
+        use_slot_attention=args.use_slot_attention,
+        num_slots=args.num_slots,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    model.train()
+    for epoch in range(args.epochs):
+        running = 0.0
+        for batch in loader:
+            points = batch["points"].to(device)
+            features = batch["features"].to(device)
+            aug_features = make_augmented_features(features)
+
+            outputs = model(features)
+            outputs_aug = model(aug_features)
+            loss, stats = total_unsupervised_loss(
+                points=points,
+                embeddings=outputs["embeddings"],
+                num_clusters=args.num_clusters,
+                contrastive_pair=outputs_aug["embeddings"],
+            )
+
+            if args.use_slot_attention and "slots" in outputs:
+                slot_separation = torch.pdist(outputs["slots"].reshape(-1, outputs["slots"].shape[-1])).mean()
+                loss = loss - 0.05 * slot_separation
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running += loss.item()
+
+        average = running / max(1, len(loader))
+        print(
+            f"epoch={epoch + 1}/{args.epochs} loss={average:.4f} "
+            f"smooth={stats['smooth'].item():.4f} separation={stats['separation'].item():.4f} "
+            f"compactness={stats['compactness'].item():.4f} contrastive={stats['contrastive'].item():.4f}"
+        )
+
+    checkpoint = {
+        "model_state": model.state_dict(),
+        "input_dim": 6 if args.use_normals else 3,
+        "embedding_dim": args.embedding_dim,
+        "num_slots": args.num_slots,
+        "use_slot_attention": args.use_slot_attention,
+        "num_clusters": args.num_clusters,
+    }
+    torch.save(checkpoint, args.save_path)
+    print(f"Saved checkpoint to {os.path.abspath(args.save_path)}")
+
+
+if __name__ == "__main__":
+    main()
