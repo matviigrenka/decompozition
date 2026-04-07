@@ -4,7 +4,15 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from dataset import estimate_normals, load_obj_mesh, load_point_cloud, normalize_point_cloud, sample_points_from_mesh
+from dataset import (
+    estimate_normals,
+    farthest_point_sampling,
+    load_obj_mesh,
+    load_off_mesh,
+    load_point_cloud,
+    normalize_point_cloud,
+    sample_points_from_mesh,
+)
 
 
 def load_input_as_point_cloud(path: str, num_points: int = 2048, use_normals: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -12,19 +20,16 @@ def load_input_as_point_cloud(path: str, num_points: int = 2048, use_normals: bo
     if ext == ".obj":
         vertices, faces = load_obj_mesh(path)
         points, normals = sample_points_from_mesh(vertices, faces, num_points=num_points, compute_normals=use_normals)
+    elif ext == ".off":
+        vertices, faces = load_off_mesh(path)
+        points, normals = sample_points_from_mesh(vertices, faces, num_points=num_points, compute_normals=use_normals)
     else:
         points, normals = load_point_cloud(path)
-        if points.shape[0] > num_points:
-            ids = np.random.choice(points.shape[0], num_points, replace=False)
-            points = points[ids]
-            if normals is not None:
-                normals = normals[ids]
-        elif points.shape[0] < num_points:
-            ids = np.random.choice(points.shape[0], num_points - points.shape[0], replace=True)
-            points = np.concatenate([points, points[ids]], axis=0)
-            if normals is not None:
-                normals = np.concatenate([normals, normals[ids]], axis=0)
-        if use_normals and normals is None:
+        ids = farthest_point_sampling(points, num_points)
+        points = points[ids]
+        if normals is not None:
+            normals = normals[ids]
+        elif use_normals:
             normals = estimate_normals(points)
     points = normalize_point_cloud(points)
     return points.astype(np.float32), None if normals is None else normals.astype(np.float32)

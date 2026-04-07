@@ -33,10 +33,46 @@ def load_obj_mesh(path: str) -> Tuple[np.ndarray, np.ndarray]:
     return vertices_np, faces_np
 
 
+def load_off_mesh(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    with open(path, "r", encoding="utf-8") as handle:
+        header = handle.readline().strip()
+        if header == "OFF":
+            counts_line = handle.readline().strip()
+        elif header.startswith("OFF"):
+            counts_line = header[3:].strip()
+        else:
+            raise ValueError(f"Invalid OFF header in file: {path}")
+        while not counts_line or counts_line.startswith("#"):
+            counts_line = handle.readline().strip()
+        num_vertices, num_faces, _ = map(int, counts_line.split()[:3])
+        vertices = []
+        for _ in range(num_vertices):
+            values = handle.readline().strip().split()
+            vertices.append([float(values[0]), float(values[1]), float(values[2])])
+        faces = []
+        for _ in range(num_faces):
+            tokens = handle.readline().strip().split()
+            if not tokens:
+                continue
+            degree = int(tokens[0])
+            indices = [int(value) for value in tokens[1 : 1 + degree]]
+            if len(indices) >= 3:
+                for idx in range(1, len(indices) - 1):
+                    faces.append([indices[0], indices[idx], indices[idx + 1]])
+    return np.asarray(vertices, dtype=np.float32), np.asarray(faces, dtype=np.int64)
+
+
 def load_point_cloud(path: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".npy":
         array = np.load(path)
+    elif ext == ".npz":
+        data = np.load(path)
+        if "points" not in data:
+            raise ValueError(f"Unified NPZ file is missing 'points': {path}")
+        points = data["points"].astype(np.float32)
+        normals = data["normals"].astype(np.float32) if "normals" in data and data["normals"].size > 0 else None
+        return points, normals
     else:
         array = np.loadtxt(path, dtype=np.float32)
     if array.ndim != 2 or array.shape[1] < 3:
@@ -150,12 +186,13 @@ class MeshPointCloudDataset(Dataset):
     def _discover_files(self, data_dir: Optional[str]) -> List[str]:
         if data_dir is None or not os.path.isdir(data_dir):
             return []
-        supported = {".obj", ".xyz", ".txt", ".pts", ".npy"}
+        supported = {".obj", ".off", ".xyz", ".txt", ".pts", ".npy", ".npz"}
         files = []
-        for name in os.listdir(data_dir):
-            path = os.path.join(data_dir, name)
-            if os.path.isfile(path) and os.path.splitext(name)[1].lower() in supported:
-                files.append(path)
+        for root, _, names in os.walk(data_dir):
+            for name in names:
+                path = os.path.join(root, name)
+                if os.path.isfile(path) and os.path.splitext(name)[1].lower() in supported:
+                    files.append(path)
         files.sort()
         return files
 
@@ -166,6 +203,9 @@ class MeshPointCloudDataset(Dataset):
         ext = os.path.splitext(path)[1].lower()
         if ext == ".obj":
             vertices, faces = load_obj_mesh(path)
+            points, normals = sample_points_from_mesh(vertices, faces, self.num_points, self.use_normals)
+        elif ext == ".off":
+            vertices, faces = load_off_mesh(path)
             points, normals = sample_points_from_mesh(vertices, faces, self.num_points, self.use_normals)
         else:
             points, normals = load_point_cloud(path)

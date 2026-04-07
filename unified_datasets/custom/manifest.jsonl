@@ -1,0 +1,1 @@
+{"dataset": "custom", "split": "train", "category": "demo", "source_path": "raw_datasets\\custom\\custom\\train\\demo\\sample.npy", "output_path": "train\\demo\\sample.npz", "num_points": 128, "has_normals": true}
