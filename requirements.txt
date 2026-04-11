@@ -1,0 +1,5 @@
+numpy>=1.24
+torch>=2.2
+
+# Optional: only needed for interactive 3D visualization in inference.py
+open3d>=0.18

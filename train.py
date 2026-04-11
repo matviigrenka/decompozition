@@ -12,7 +12,7 @@ from utils import make_augmented_features
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train an unsupervised 3D part decomposition model.")
-    parser.add_argument("--data-dir", type=str, default=None, help="Directory with .obj/.xyz/.txt/.pts/.npy files.")
+    parser.add_argument("--data-dir", type=str, default=None, help="Directory with .obj/.off/.xyz/.txt/.pts/.npy/.npz files.")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-points", type=int, default=2048)
@@ -24,12 +24,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-slots", type=int, default=8)
     parser.add_argument("--synthetic-size", type=int, default=64, help="Used when no real dataset directory is provided.")
     parser.add_argument("--save-path", type=str, default="checkpoint.pt")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision on CUDA.")
+    parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision even when CUDA is available.")
     return parser.parse_args()
+
+
+def resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested with --device cuda, but torch.cuda.is_available() is False.")
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def main() -> None:
     args = parse_args()
-    device = torch.device("cpu")
+    device = resolve_device(args.device)
+    use_cuda = device.type == "cuda"
+    use_amp = use_cuda and not args.no_amp
+    if args.amp:
+        use_amp = use_cuda
+
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
+        device_name = torch.cuda.get_device_name(0)
+        print(f"Using GPU: {device_name}")
+    else:
+        print("Using CPU")
 
     dataset = MeshPointCloudDataset(
         data_dir=args.data_dir,
@@ -37,7 +62,15 @@ def main() -> None:
         use_normals=args.use_normals,
         synthetic_size=args.synthetic_size,
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=args.num_workers,
+        pin_memory=use_cuda,
+        persistent_workers=args.num_workers > 0,
+    )
 
     model = PointDecompositionModel(
         input_dim=6 if args.use_normals else 3,
@@ -46,39 +79,47 @@ def main() -> None:
         num_slots=args.num_slots,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     model.train()
     for epoch in range(args.epochs):
         running = 0.0
+        last_stats = None
         for batch in loader:
-            points = batch["points"].to(device)
-            features = batch["features"].to(device)
+            points = batch["points"].to(device, non_blocking=use_cuda)
+            features = batch["features"].to(device, non_blocking=use_cuda)
             aug_features = make_augmented_features(features)
 
-            outputs = model(features)
-            outputs_aug = model(aug_features)
-            loss, stats = total_unsupervised_loss(
-                points=points,
-                embeddings=outputs["embeddings"],
-                num_clusters=args.num_clusters,
-                contrastive_pair=outputs_aug["embeddings"],
-            )
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                outputs = model(features)
+                outputs_aug = model(aug_features)
+                loss, stats = total_unsupervised_loss(
+                    points=points,
+                    embeddings=outputs["embeddings"],
+                    num_clusters=args.num_clusters,
+                    contrastive_pair=outputs_aug["embeddings"],
+                )
 
-            if args.use_slot_attention and "slots" in outputs:
-                slot_separation = torch.pdist(outputs["slots"].reshape(-1, outputs["slots"].shape[-1])).mean()
-                loss = loss - 0.05 * slot_separation
+                if args.use_slot_attention and "slots" in outputs:
+                    slot_separation = torch.pdist(outputs["slots"].reshape(-1, outputs["slots"].shape[-1])).mean()
+                    loss = loss - 0.05 * slot_separation
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             running += loss.item()
+            last_stats = stats
 
         average = running / max(1, len(loader))
-        print(
-            f"epoch={epoch + 1}/{args.epochs} loss={average:.4f} "
-            f"smooth={stats['smooth'].item():.4f} separation={stats['separation'].item():.4f} "
-            f"compactness={stats['compactness'].item():.4f} contrastive={stats['contrastive'].item():.4f}"
-        )
+        if last_stats is None:
+            print(f"epoch={epoch + 1}/{args.epochs} loss={average:.4f}")
+        else:
+            print(
+                f"epoch={epoch + 1}/{args.epochs} loss={average:.4f} "
+                f"smooth={last_stats['smooth'].item():.4f} separation={last_stats['separation'].item():.4f} "
+                f"compactness={last_stats['compactness'].item():.4f} contrastive={last_stats['contrastive'].item():.4f}"
+            )
 
     checkpoint = {
         "model_state": model.state_dict(),
@@ -87,6 +128,8 @@ def main() -> None:
         "num_slots": args.num_slots,
         "use_slot_attention": args.use_slot_attention,
         "num_clusters": args.num_clusters,
+        "device": str(device),
+        "amp": use_amp,
     }
     torch.save(checkpoint, args.save_path)
     print(f"Saved checkpoint to {os.path.abspath(args.save_path)}")
