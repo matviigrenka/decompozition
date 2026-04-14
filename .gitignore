@@ -1,1 +1,9 @@
-/__pycache__
+/__pycache__/
+.venv/
+raw_datasets/
+unified_datasets/
+*.pt
+*.ply
+*.npz
+*.npy
+*.blend

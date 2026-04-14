@@ -3,6 +3,7 @@
 numpy>=1.24
 # Official PyTorch CUDA 12.1 wheel line for Windows/Linux GPU installs.
 torch==2.5.0+cu121
+tqdm>=4.66
 
 # Optional: only needed for interactive 3D visualization in inference.py
 open3d>=0.18

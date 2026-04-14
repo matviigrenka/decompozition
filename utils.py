@@ -1,5 +1,5 @@
 ﻿import os
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,24 +15,39 @@ from dataset import (
 )
 
 
-def load_input_as_point_cloud(path: str, num_points: int = 2048, use_normals: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def prepare_inference_data(path: str, num_points: int = 2048, use_normals: bool = False) -> Dict[str, np.ndarray]:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".obj":
         vertices, faces = load_obj_mesh(path)
-        points, normals = sample_points_from_mesh(vertices, faces, num_points=num_points, compute_normals=use_normals)
+        original_points, normals = sample_points_from_mesh(vertices, faces, num_points=num_points, compute_normals=use_normals)
     elif ext == ".off":
         vertices, faces = load_off_mesh(path)
-        points, normals = sample_points_from_mesh(vertices, faces, num_points=num_points, compute_normals=use_normals)
+        original_points, normals = sample_points_from_mesh(vertices, faces, num_points=num_points, compute_normals=use_normals)
     else:
         points, normals = load_point_cloud(path)
         ids = farthest_point_sampling(points, num_points)
-        points = points[ids]
+        original_points = points[ids]
         if normals is not None:
             normals = normals[ids]
         elif use_normals:
-            normals = estimate_normals(points)
-    points = normalize_point_cloud(points)
-    return points.astype(np.float32), None if normals is None else normals.astype(np.float32)
+            normals = estimate_normals(original_points)
+
+    normalized_points = normalize_point_cloud(original_points)
+    if use_normals and normals is not None:
+        features = np.concatenate([normalized_points, normals], axis=1)
+    else:
+        features = normalized_points
+    return {
+        "original_points": original_points.astype(np.float32),
+        "normalized_points": normalized_points.astype(np.float32),
+        "normals": None if normals is None else normals.astype(np.float32),
+        "features": features.astype(np.float32),
+    }
+
+
+def load_input_as_point_cloud(path: str, num_points: int = 2048, use_normals: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    data = prepare_inference_data(path, num_points=num_points, use_normals=use_normals)
+    return data["normalized_points"], data["normals"]
 
 
 def random_rotation(points: torch.Tensor) -> torch.Tensor:
@@ -127,6 +142,16 @@ def save_colored_ply(path: str, points: np.ndarray, labels: np.ndarray) -> None:
             handle.write(
                 f"{point[0]:.6f} {point[1]:.6f} {point[2]:.6f} {int(color[0])} {int(color[1])} {int(color[2])}\n"
             )
+
+
+def save_blender_segmentation(path: str, input_path: str, sampled_points: np.ndarray, labels: np.ndarray) -> None:
+    np.savez_compressed(
+        path,
+        input_path=np.asarray(input_path),
+        sampled_points=sampled_points.astype(np.float32),
+        labels=labels.astype(np.int32),
+        colors=labels_to_colors(labels).astype(np.uint8),
+    )
 
 
 def maybe_visualize(points: np.ndarray, labels: np.ndarray) -> None:

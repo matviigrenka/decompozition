@@ -9,6 +9,11 @@ from loss import total_unsupervised_loss
 from model import PointDecompositionModel
 from utils import make_augmented_features
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - fallback keeps training usable without tqdm
+    tqdm = None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train an unsupervised 3D part decomposition model.")
@@ -39,6 +44,12 @@ def resolve_device(device_arg: str) -> torch.device:
             raise RuntimeError("CUDA was requested with --device cuda, but torch.cuda.is_available() is False.")
         return torch.device("cuda")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def make_progress(iterable, **kwargs):
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, **kwargs)
 
 
 def main() -> None:
@@ -82,10 +93,17 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     model.train()
-    for epoch in range(args.epochs):
+    epoch_bar = make_progress(range(args.epochs), desc="Training", unit="epoch")
+    for epoch in epoch_bar:
         running = 0.0
         last_stats = None
-        for batch in loader:
+        batch_bar = make_progress(
+            loader,
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            unit="batch",
+            leave=False,
+        )
+        for batch in batch_bar:
             points = batch["points"].to(device, non_blocking=use_cuda)
             features = batch["features"].to(device, non_blocking=use_cuda)
             aug_features = make_augmented_features(features)
@@ -111,10 +129,19 @@ def main() -> None:
             running += loss.item()
             last_stats = stats
 
+            if tqdm is not None:
+                batch_bar.set_postfix(loss=f"{loss.item():.4f}")
+
         average = running / max(1, len(loader))
         if last_stats is None:
             print(f"epoch={epoch + 1}/{args.epochs} loss={average:.4f}")
         else:
+            if tqdm is not None:
+                epoch_bar.set_postfix(
+                    loss=f"{average:.4f}",
+                    smooth=f"{last_stats['smooth'].item():.4f}",
+                    separation=f"{last_stats['separation'].item():.4f}",
+                )
             print(
                 f"epoch={epoch + 1}/{args.epochs} loss={average:.4f} "
                 f"smooth={last_stats['smooth'].item():.4f} separation={last_stats['separation'].item():.4f} "
