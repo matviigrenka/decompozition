@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from dataset import MeshPointCloudDataset
 from loss import total_unsupervised_loss
 from model import PointDecompositionModel
-from utils import make_augmented_features
+from utils import make_augmented_features, set_global_seed
 
 try:
     from tqdm.auto import tqdm
@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-path", type=str, default="checkpoint.pt")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision on CUDA.")
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision even when CUDA is available.")
     return parser.parse_args()
@@ -54,14 +55,17 @@ def make_progress(iterable, **kwargs):
 
 def main() -> None:
     args = parse_args()
+    set_global_seed(args.seed)
     device = resolve_device(args.device)
     use_cuda = device.type == "cuda"
     use_amp = use_cuda and not args.no_amp
     if args.amp:
         use_amp = use_cuda
 
+    if use_cuda and not args.amp and not args.no_amp:
+        print("AMP is available. Consider adding --amp for faster RTX inference/training.")
+
     if use_cuda:
-        torch.backends.cudnn.benchmark = True
         device_name = torch.cuda.get_device_name(0)
         print(f"Using GPU: {device_name}")
     else:
@@ -157,6 +161,7 @@ def main() -> None:
         "num_clusters": args.num_clusters,
         "device": str(device),
         "amp": use_amp,
+        "seed": args.seed,
     }
     torch.save(checkpoint, args.save_path)
     print(f"Saved checkpoint to {os.path.abspath(args.save_path)}")

@@ -1,4 +1,5 @@
 ﻿import os
+import random
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -13,6 +14,22 @@ from dataset import (
     normalize_point_cloud,
     sample_points_from_mesh,
 )
+
+
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
 
 def prepare_inference_data(path: str, num_points: int = 2048, use_normals: bool = False) -> Dict[str, np.ndarray]:
@@ -81,27 +98,70 @@ def make_augmented_features(features: torch.Tensor) -> torch.Tensor:
     return aug_features
 
 
+def _kmeans_plus_plus_init(
+    points: torch.Tensor,
+    num_clusters: int,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    num_points = points.shape[0]
+    centers = torch.empty((num_clusters, points.shape[1]), device=points.device, dtype=points.dtype)
+    first_idx = torch.randint(num_points, (1,), device=points.device, generator=generator).item()
+    centers[0] = points[first_idx]
+    closest_dist_sq = torch.sum((points - centers[0]) ** 2, dim=1)
+    for center_idx in range(1, num_clusters):
+        probs = closest_dist_sq / closest_dist_sq.sum().clamp_min(1e-12)
+        next_idx = torch.multinomial(probs, num_samples=1, replacement=False, generator=generator).item()
+        centers[center_idx] = points[next_idx]
+        dist_sq = torch.sum((points - centers[center_idx]) ** 2, dim=1)
+        closest_dist_sq = torch.minimum(closest_dist_sq, dist_sq)
+    return centers
+
+
 def torch_kmeans(
     points: torch.Tensor,
     num_clusters: int,
-    num_iters: int = 20,
+    num_iters: int = 30,
+    num_restarts: int = 5,
+    seed: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_points = points.shape[0]
-    initial_ids = torch.randperm(num_points, device=points.device)[:num_clusters]
-    centers = points[initial_ids]
-    labels = torch.zeros(num_points, dtype=torch.long, device=points.device)
-    for _ in range(num_iters):
-        distances = torch.cdist(points, centers)
-        labels = distances.argmin(dim=1)
-        next_centers = []
-        for idx in range(num_clusters):
-            mask = labels == idx
-            if mask.any():
-                next_centers.append(points[mask].mean(dim=0))
-            else:
-                next_centers.append(centers[idx])
-        centers = torch.stack(next_centers, dim=0)
-    return labels, centers
+    if num_clusters > num_points:
+        raise ValueError(f"num_clusters={num_clusters} is larger than the number of points={num_points}")
+
+    best_inertia = None
+    best_labels = None
+    best_centers = None
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=points.device)
+        generator.manual_seed(seed)
+
+    for _ in range(max(1, num_restarts)):
+        centers = _kmeans_plus_plus_init(points, num_clusters, generator=generator)
+        labels = torch.zeros(num_points, dtype=torch.long, device=points.device)
+        for _ in range(num_iters):
+            distances = torch.cdist(points, centers)
+            labels = distances.argmin(dim=1)
+            next_centers = []
+            for idx in range(num_clusters):
+                mask = labels == idx
+                if mask.any():
+                    next_centers.append(points[mask].mean(dim=0))
+                else:
+                    next_centers.append(centers[idx])
+            next_centers = torch.stack(next_centers, dim=0)
+            if torch.allclose(next_centers, centers, atol=1e-5):
+                centers = next_centers
+                break
+            centers = next_centers
+        final_distances = torch.cdist(points, centers)
+        inertia = final_distances[torch.arange(num_points, device=points.device), labels].pow(2).mean()
+        if best_inertia is None or inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels.clone()
+            best_centers = centers.clone()
+
+    return best_labels, best_centers
 
 
 def labels_to_colors(labels: np.ndarray) -> np.ndarray:

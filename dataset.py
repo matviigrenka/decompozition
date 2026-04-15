@@ -157,7 +157,8 @@ def farthest_point_sampling(points: np.ndarray, num_samples: int) -> np.ndarray:
         return np.arange(points.shape[0])
     indices = np.zeros(num_samples, dtype=np.int64)
     distances = np.full(points.shape[0], 1e10, dtype=np.float32)
-    farthest = np.random.randint(0, points.shape[0])
+    centroid = points.mean(axis=0, keepdims=True)
+    farthest = int(np.argmax(np.sum((points - centroid) ** 2, axis=1)))
     for i in range(num_samples):
         indices[i] = farthest
         centroid = points[farthest]

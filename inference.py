@@ -4,7 +4,7 @@ import os
 import torch
 
 from model import PointDecompositionModel
-from utils import maybe_visualize, prepare_inference_data, save_blender_segmentation, save_colored_ply, torch_kmeans
+from utils import maybe_visualize, prepare_inference_data, save_blender_segmentation, save_colored_ply, set_global_seed, torch_kmeans
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,6 +18,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-slot-attention", action="store_true")
     parser.add_argument("--num-slots", type=int, default=8)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--kmeans-iters", type=int, default=30)
+    parser.add_argument("--kmeans-restarts", type=int, default=5)
     parser.add_argument("--output", type=str, default="segmented_output.ply")
     parser.add_argument(
         "--blender-output",
@@ -39,9 +42,14 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def build_model(args: argparse.Namespace, device: torch.device) -> PointDecompositionModel:
-    if args.checkpoint is not None:
-        checkpoint = torch.load(args.checkpoint, map_location=device)
+def load_checkpoint_metadata(args: argparse.Namespace, device: torch.device):
+    if args.checkpoint is None:
+        return None
+    return torch.load(args.checkpoint, map_location=device)
+
+
+def build_model(args: argparse.Namespace, device: torch.device, checkpoint=None) -> PointDecompositionModel:
+    if checkpoint is not None:
         model = PointDecompositionModel(
             input_dim=checkpoint.get("input_dim", 6 if args.use_normals else 3),
             embedding_dim=checkpoint.get("embedding_dim", args.embedding_dim),
@@ -65,18 +73,34 @@ def default_blender_output(output_path: str) -> str:
 
 def main() -> None:
     args = parse_args()
+    set_global_seed(args.seed)
     device = resolve_device(args.device)
-    inference_data = prepare_inference_data(args.input, num_points=args.num_points, use_normals=args.use_normals)
+    checkpoint = load_checkpoint_metadata(args, device)
+
+    expected_input_dim = checkpoint.get("input_dim", 6 if args.use_normals else 3) if checkpoint is not None else (6 if args.use_normals else 3)
+    effective_use_normals = expected_input_dim > 3
+    if args.use_normals and not effective_use_normals:
+        print("Checkpoint was trained without normals (input_dim=3). Ignoring --use-normals for inference.")
+    if not args.use_normals and effective_use_normals:
+        print("Checkpoint expects normals (input_dim=6). Computing normals automatically for inference.")
+
+    inference_data = prepare_inference_data(args.input, num_points=args.num_points, use_normals=effective_use_normals)
     points = inference_data["normalized_points"]
     features = inference_data["features"]
 
-    model = build_model(args, device)
+    model = build_model(args, device, checkpoint=checkpoint)
     model.eval()
     with torch.no_grad():
         tensor = torch.from_numpy(features).unsqueeze(0).to(device)
         outputs = model(tensor)
         embeddings = outputs["embeddings"][0]
-        labels, _ = torch_kmeans(embeddings, num_clusters=args.num_clusters)
+        labels, _ = torch_kmeans(
+            embeddings,
+            num_clusters=args.num_clusters,
+            num_iters=args.kmeans_iters,
+            num_restarts=args.kmeans_restarts,
+            seed=args.seed,
+        )
 
     labels_np = labels.cpu().numpy().astype("int32")
     save_colored_ply(args.output, points, labels_np)

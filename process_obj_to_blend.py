@@ -1,5 +1,4 @@
 ﻿import argparse
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +17,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-slot-attention", action="store_true")
     parser.add_argument("--num-slots", type=int, default=8)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--kmeans-iters", type=int, default=30)
+    parser.add_argument("--kmeans-restarts", type=int, default=5)
+    parser.add_argument("--smooth-iters", type=int, default=2)
     parser.add_argument("--separate", action="store_true", help="Split result into separate objects by cluster")
     parser.add_argument("--vertex-groups", action="store_true", help="Create Blender vertex groups for each cluster")
     parser.add_argument("--keep-intermediate", action="store_true", help="Keep intermediate PLY and NPZ outputs")
@@ -72,6 +75,12 @@ def main() -> None:
         str(args.num_slots),
         "--device",
         args.device,
+        "--seed",
+        str(args.seed),
+        "--kmeans-iters",
+        str(args.kmeans_iters),
+        "--kmeans-restarts",
+        str(args.kmeans_restarts),
         "--output",
         str(ply_path),
         "--blender-output",
@@ -96,6 +105,8 @@ def main() -> None:
         str(input_path),
         "--output-blend",
         str(output_blend),
+        "--smooth-iters",
+        str(args.smooth_iters),
     ]
     if args.vertex_groups:
         blender_cmd.append("--vertex-groups")

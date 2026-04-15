@@ -39,15 +39,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vertex-groups", action="store_true", help="Create a vertex group per cluster.")
     parser.add_argument("--material-prefix", default="Part", help="Prefix for generated materials.")
     parser.add_argument("--output-blend", default=None, help="Optional .blend path to save after processing.")
+    parser.add_argument("--smooth-iters", type=int, default=2, help="Neighbor label smoothing iterations on the mesh.")
     return parser.parse_args(argv)
 
 
-def import_mesh_if_needed(mesh_path: str):
+def clear_scene() -> None:
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete(use_global=False)
+    for mesh in list(bpy.data.meshes):
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+    for material in list(bpy.data.materials):
+        if material.users == 0:
+            bpy.data.materials.remove(material)
+
+
+def import_mesh(mesh_path: str):
+    clear_scene()
+    before_names = set(obj.name for obj in bpy.data.objects)
     if hasattr(bpy.ops.wm, "obj_import"):
         bpy.ops.wm.obj_import(filepath=mesh_path)
-        return bpy.context.selected_objects[-1]
-    bpy.ops.import_scene.obj(filepath=mesh_path)
-    return bpy.context.selected_objects[-1]
+    else:
+        bpy.ops.import_scene.obj(filepath=mesh_path)
+    imported = [obj for obj in bpy.data.objects if obj.name not in before_names and obj.type == "MESH"]
+    if not imported:
+        imported = [obj for obj in bpy.context.selected_objects if obj.type == "MESH"]
+    if not imported:
+        raise ValueError(f"No mesh objects were imported from {mesh_path}")
+    if len(imported) == 1:
+        obj = imported[0]
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+        return obj
+
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in imported:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = imported[0]
+    bpy.ops.object.join()
+    joined = bpy.context.view_layer.objects.active
+    return joined
 
 
 def get_target_object(args: argparse.Namespace):
@@ -56,10 +87,10 @@ def get_target_object(args: argparse.Namespace):
         if obj is None:
             raise ValueError(f"Object '{args.object}' not found")
         return obj
+    if args.mesh is not None:
+        return import_mesh(args.mesh)
     if bpy.context.active_object is not None and bpy.context.active_object.type == "MESH":
         return bpy.context.active_object
-    if args.mesh is not None:
-        return import_mesh_if_needed(args.mesh)
     raise ValueError("No mesh object available. Select a mesh in Blender or pass --mesh path/to/model.obj")
 
 
@@ -72,6 +103,31 @@ def chunked_nearest_labels(vertices: np.ndarray, sampled_points: np.ndarray, sam
         nearest_ids = np.argmin(distances, axis=1)
         labels[start:end] = sampled_labels[nearest_ids]
     return labels
+
+
+def build_vertex_adjacency(mesh) -> List[List[int]]:
+    adjacency = [set() for _ in mesh.vertices]
+    for edge in mesh.edges:
+        v0, v1 = edge.vertices
+        adjacency[v0].add(v1)
+        adjacency[v1].add(v0)
+    return [sorted(neighbors) for neighbors in adjacency]
+
+
+def smooth_vertex_labels(vertex_labels: np.ndarray, adjacency: List[List[int]], num_clusters: int, num_iters: int) -> np.ndarray:
+    if num_iters <= 0:
+        return vertex_labels
+    current = vertex_labels.copy()
+    for _ in range(num_iters):
+        updated = current.copy()
+        for idx, neighbors in enumerate(adjacency):
+            if not neighbors:
+                continue
+            votes = np.bincount(current[neighbors], minlength=num_clusters)
+            votes[current[idx]] += 1
+            updated[idx] = int(np.argmax(votes))
+        current = updated
+    return current
 
 
 def ensure_materials(obj, num_clusters: int, prefix: str) -> List[bpy.types.Material]:
@@ -152,6 +208,8 @@ def main() -> None:
 
     vertices = np.array([vertex.co[:] for vertex in obj.data.vertices], dtype=np.float32)
     vertex_labels = chunked_nearest_labels(vertices, sampled_points, sampled_labels)
+    adjacency = build_vertex_adjacency(obj.data)
+    vertex_labels = smooth_vertex_labels(vertex_labels, adjacency, num_clusters, args.smooth_iters)
 
     assign_materials_and_colors(obj, vertex_labels, num_clusters, args.material_prefix)
     if args.vertex_groups:
